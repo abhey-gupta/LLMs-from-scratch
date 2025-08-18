@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from typing import cast
 
 @dataclass
-class GPTConfig:
+class ModelConfig:
+    size: str = "small"
     window_size: int = 1024
     vocab_size: int = 50257
     n_layer: int = 12
@@ -14,8 +15,25 @@ class GPTConfig:
     d_ff: int = 3072
     device: torch.device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 
+    def __post_init__(self):
+        size_map = {
+            "small":  {"n_layer": 12, "n_heads": 12, "d_model": 768,  "d_ff": 3072},
+            "medium": {"n_layer": 24, "n_heads": 16, "d_model": 1024, "d_ff": 4096},
+            "large":  {"n_layer": 36, "n_heads": 20, "d_model": 1280, "d_ff": 5120},
+            "xl":     {"n_layer": 48, "n_heads": 25, "d_model": 1600, "d_ff": 6400},
+        }
+
+        if self.size not in size_map:
+            raise ValueError(f"Invalid size '{self.size}'. Choose from {list(size_map.keys())}.")
+
+        cfg = size_map[self.size]
+        self.n_layer = cfg["n_layer"]
+        self.n_heads = cfg["n_heads"]
+        self.d_model = cfg["d_model"]
+        self.d_ff = cfg["d_ff"]
+
 class GPT2(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         
@@ -72,9 +90,107 @@ class GPT2(nn.Module):
             loss = None
 
         return logits, loss
+    
+    @classmethod
+    def from_pretrained(cls, model_size='124M'):
+        from transformers import GPT2LMHeadModel
+
+        size_map = {
+            '124M': 'gpt2',
+            '355M': 'gpt2-medium',
+            '774M': 'gpt2-large',
+            '1558M': 'gpt2-xl'
+        }
+        if model_size not in size_map:
+            raise ValueError(f"Invalid size {model_size}. Choose from {list(size_map.keys())}")
+
+        hf_model = GPT2LMHeadModel.from_pretrained(size_map[model_size])
+        hf_cfg = hf_model.config
+        hf_state = hf_model.state_dict()
+
+        config = ModelConfig(
+            window_size=hf_cfg.n_positions,
+            vocab_size=hf_cfg.vocab_size,
+            n_layer=hf_cfg.n_layer,
+            n_heads=hf_cfg.n_head,
+            d_model=hf_cfg.n_embd,
+            d_ff=hf_cfg.n_inner if hf_cfg.n_inner is not None else 4 * hf_cfg.n_embd
+        )
+        model = cls(config)
+        own_sd = model.state_dict()
+
+        # Copy token & position embeddings
+        own_sd["transformer.wte.weight"] = hf_state["transformer.wte.weight"]
+        own_sd["transformer.wpe.weight"] = hf_state["transformer.wpe.weight"]
+
+        # Loop over each block
+        for layer in range(config.n_layer):
+            # LayerNorms
+            for ln in ["ln_1", "ln_2"]:
+                own_sd[f"transformer.h.{layer}.{ln}.weight"] = hf_state[f"transformer.h.{layer}.{ln}.weight"]
+                own_sd[f"transformer.h.{layer}.{ln}.bias"] = hf_state[f"transformer.h.{layer}.{ln}.bias"]
+
+            # Attention Q, K, V
+            c_attn_w = hf_state[f"transformer.h.{layer}.attn.c_attn.weight"]
+            c_attn_b = hf_state[f"transformer.h.{layer}.attn.c_attn.bias"]
+            d = config.d_model
+            own_sd[f"transformer.h.{layer}.attn.query.weight"] = c_attn_w[:, :d].T
+            own_sd[f"transformer.h.{layer}.attn.key.weight"]   = c_attn_w[:, d:2*d].T
+            own_sd[f"transformer.h.{layer}.attn.value.weight"] = c_attn_w[:, 2*d:].T
+            own_sd[f"transformer.h.{layer}.attn.query.bias"] = c_attn_b[:d]
+            own_sd[f"transformer.h.{layer}.attn.key.bias"]   = c_attn_b[d:2*d]
+            own_sd[f"transformer.h.{layer}.attn.value.bias"] = c_attn_b[2*d:]
+
+            # Attention output projection
+            own_sd[f"transformer.h.{layer}.attn.out_proj.weight"] = hf_state[f"transformer.h.{layer}.attn.c_proj.weight"].T
+            own_sd[f"transformer.h.{layer}.attn.out_proj.bias"]   = hf_state[f"transformer.h.{layer}.attn.c_proj.bias"]
+
+            # FFN
+            own_sd[f"transformer.h.{layer}.ff.c_fc.weight"] = hf_state[f"transformer.h.{layer}.mlp.c_fc.weight"].T
+            own_sd[f"transformer.h.{layer}.ff.c_fc.bias"]   = hf_state[f"transformer.h.{layer}.mlp.c_fc.bias"]
+            own_sd[f"transformer.h.{layer}.ff.c_proj.weight"] = hf_state[f"transformer.h.{layer}.mlp.c_proj.weight"].T
+            own_sd[f"transformer.h.{layer}.ff.c_proj.bias"]   = hf_state[f"transformer.h.{layer}.mlp.c_proj.bias"]
+
+        # Final layer norm
+        own_sd["transformer.ln_f.weight"] = hf_state["transformer.ln_f.weight"]
+        own_sd["transformer.ln_f.bias"]   = hf_state["transformer.ln_f.bias"]
+
+        # LM Head
+        own_sd["lm_head.weight"] = hf_state["lm_head.weight"]
+
+        model.load_state_dict(own_sd)
+        return model
+
+    def generate(self, prompt: str, max_tokens: int = 50, eos_token_id: int = 50256, temperature=1.0):
+        from transformers import GPT2Tokenizer
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        
+        self.eval()
+        device = next(self.parameters()).device
+
+        # Encode prompt
+        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+        print(prompt, end="")
+        # Autoregressive loop
+        for _ in range(max_tokens):
+            input_ids = input_ids[:, -self.config.window_size:]
+            logits, _ = self(input_ids)
+            next_token_logits = logits[:, -1, :] / temperature
+            probs = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            if next_token.item() == eos_token_id:
+                break
+            print(tokenizer.decode(next_token.item()), end="", flush=True)
+
+            # Append to sequence
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+
+        return input_ids[0]
 
 class Block(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         
         self.ln_1 = nn.LayerNorm(config.d_model)
@@ -140,3 +256,13 @@ class FFN(nn.Module):
         x = self.c_fc(x)
         x = self.gelu(x)
         return self.c_proj(x)
+    
+
+if __name__ == "__main__":
+    config = ModelConfig()
+    print('loaded config')
+    model = GPT2.from_pretrained('355M').to(config.device)
+    print('loaded model')
+    model.generate(
+        "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nIdentify the correct spelling of the following word.\n\n ### Input:\nOcassion", 
+        max_tokens=100)

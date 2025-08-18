@@ -1,9 +1,9 @@
 import torch
 import time
-from model import GPTConfig, GPT2
+from model import ModelConfig, GPT2
 from dataset import DataLoader
 
-config = GPTConfig(vocab_size=50304)
+config = ModelConfig(vocab_size=50304)
 print('Using device:', config.device)
 
 train_loader = DataLoader('dataset.txt', B=4, T=1024)
